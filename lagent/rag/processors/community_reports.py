@@ -1,10 +1,12 @@
 import json
 import re
 from typing import Dict, Optional, List, Any
-
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 
 from lagent.rag.doc import Storage
+from lagent.utils import create_object
+from lagent.llms.deepseek import DeepseekAPI
 from lagent.rag.processors.extract_communities import get_community_hierarchy
 from lagent.rag.prompts import COMMUNITY_REPORT_PROMPT
 from lagent.rag.schema import MultiLayerGraph, Community, CommunityReport, CommunityContext, Node, Relationship
@@ -81,8 +83,7 @@ def select_sub_communities(community_id: str, level: int, community_hierarchy: D
 
 
 def merge_info(level: int, communities: List[Community],
-               level_nodes: List[Node], level_relas: List[Relationship], level_claims: Optional = None) -> List[
-    CommunityContext]:
+               level_nodes: List[Node], level_relas: List[Relationship]) -> List[CommunityContext]:
     """
         Aggregates information for each community at a given level, including nodes and relationships.
 
@@ -91,7 +92,6 @@ def merge_info(level: int, communities: List[Community],
             communities (List[Community]): A list of Community instances.
             level_nodes (List[Node]): A list of Node instances at the current level.
             level_relas (List[Relationship]): A list of Relationship instances at the current level.
-            level_claims (Optional[List[Any]]): A list of claims associated with the communities, if any.
 
         Returns:
             List[CommunityContext]: A list of CommunityContext instances containing aggregated information.
@@ -103,14 +103,9 @@ def merge_info(level: int, communities: List[Community],
     for community in communities:
         if community.level != level:
             raise ValueError(f"community shouldn't exist in level_{level}")
-        # if community.community_id not in merged_CommunityContext:
-        #     merged_CommunityContext[community.community_id] = {}
 
         community_nodes = filter_nodes_by_commu(level_nodes, community.community_id)
         community_relas = filter_relas_by_nodes(community_nodes, level_relas)
-        community_claims = None
-        # if level_claims is not None:
-        #     community_claims = filter_claims_by_nodes(community_nodes, level_claims)
 
         nodes_info = {}
         for node in community_nodes:
@@ -128,15 +123,12 @@ def merge_info(level: int, communities: List[Community],
                 'description': rela.description if rela.description is not None else '',
                 'degree': rela.degree
             }
-        if community_claims is not None:
-            pass
 
         merged_community_context.append(
             CommunityContext(community_id=community.community_id,
                              level=level,
                              nodes_info=nodes_info,
-                             edges_info=relas_info,
-                             claims=community_claims,
+                             edges_info=relas_info
                              )
         )
 
@@ -144,15 +136,13 @@ def merge_info(level: int, communities: List[Community],
 
 
 def get_context_str(nodes: Optional[List[Dict]] = None, relas: Optional[List[Dict]] = None,
-                    claims: Optional[List[Dict]] = None,
                     sub_community_reports: Optional[List[CommunityReport]] = None) -> str:
     """
-        Constructs a context string based on the provided nodes, relationships, claims, and sub-community reports.
+        Constructs a context string based on the provided nodes, relationships, and sub-community reports.
 
         Args:
             nodes (Optional[List[Dict[str, Any]]]): A list of node dictionaries.
             relas (Optional[List[Dict[str, Any]]]): A list of relationship dictionaries.
-            claims (Optional[List[Dict[str, Any]]]): A list of claim dictionaries.
             sub_community_reports (Optional[List[CommunityReport]]): A list of sub-community reports.
 
         Returns:
@@ -177,11 +167,6 @@ def get_context_str(nodes: Optional[List[Dict]] = None, relas: Optional[List[Dic
         relas_csv = relas_df.to_csv(index=False, sep=',')
         context_str.append(f'--relationships--\n{relas_csv}')
 
-    if claims is not None:
-        claims_df = pd.DataFrame(claims).drop_duplicates()
-        claims_csv = claims_df.to_csv(index=False, sep=',')
-        context_str.append(claims_csv)
-
     return '\n\n'.join(context_str)
 
 
@@ -197,14 +182,16 @@ class CommunityReportsExtractor(BaseProcessor):
 
     name = 'CommunityReportsExtractor'
 
-    def __init__(self, llm, max_tokens: Optional[int] = None, tokenizer: Optional = None, prompt: Optional[str] = None):
+    def __init__(self,
+                 llm=dict(type=DeepseekAPI),
+                 max_tokens: int = DEFAULT_LLM_MAX_TOKEN,
+                 tokenizer=dict(type=SimpleTokenizer),
+                 prompt: str = COMMUNITY_REPORT_PROMPT):
         super().__init__(name='CommunityReportsExtractor')
-        self.max_tokens = max_tokens or DEFAULT_LLM_MAX_TOKEN
-        self.tokenizer = tokenizer or SimpleTokenizer()
-        self.llm = llm
-        if prompt is None:
-            prompt = COMMUNITY_REPORT_PROMPT
+        self.tokenizer = create_object(tokenizer)
+        self.llm = create_object(llm)
         self.prompt = prompt
+        self.max_tokens = max_tokens
 
     def run(self, graph: MultiLayerGraph) -> MultiLayerGraph:
 
@@ -238,10 +225,7 @@ class CommunityReportsExtractor(BaseProcessor):
                 if community.level == level:
                     level_communities.append(community)
 
-            # TODO
-            level_claims = None
-
-            merged_communities_context = merge_info(level, level_communities, level_nodes, level_relas, level_claims)
+            merged_communities_context = merge_info(level, level_communities, level_nodes, level_relas)
 
             for merged_community_context in merged_communities_context:
 
@@ -301,21 +285,17 @@ class CommunityReportsExtractor(BaseProcessor):
         community_context: str = ''
         tokenizer = self.tokenizer
 
-        # Aggregate all nodes, relationships, and claims
+        # Aggregate all nodes and relationships
         nodes_info = {}
         relas_info = {}
-        claims_info = {}
         for community_info in contexts_info:
             nodes_info = nodes_info | community_info.nodes_info
             relas_info = relas_info | community_info.edges_info
-            if community_info.claims is not None:
-                claims_info = claims_info | community_info.claims
 
         # Sort relationships based on degree in descending order
         sorted_relas_info = dict(sorted(relas_info.items(), key=lambda item: item[1]['degree'], reverse=True))
         sorted_nodes = []
         sorted_relas = []
-        sorted_claims = None
         flag = False
         for k, rela_info in sorted_relas_info.items():
 
@@ -330,9 +310,7 @@ class CommunityReportsExtractor(BaseProcessor):
 
             sorted_relas.append(rela_info)
 
-            # TODO:claims
-
-            new_context_str = get_context_str(sorted_nodes, sorted_relas, sorted_claims,
+            new_context_str = get_context_str(sorted_nodes, sorted_relas,
                                               sub_community_reports=sub_community_reports)
 
             if max_tokens is not None:
@@ -344,7 +322,7 @@ class CommunityReportsExtractor(BaseProcessor):
             for _id, node_info in nodes_info.items():
                 if node_info not in sorted_nodes:
                     sorted_nodes.append(node_info)
-                    new_context_str = get_context_str(sorted_nodes, sorted_relas, sorted_claims)
+                    new_context_str = get_context_str(sorted_nodes, sorted_relas)
 
                     if max_tokens is not None:
                         if tokenizer.get_token_num(new_context_str) > max_tokens:
@@ -353,7 +331,7 @@ class CommunityReportsExtractor(BaseProcessor):
 
         if community_context == '':
             # Handle cases where context is too long by reducing content or increasing token limit
-            community_context = get_context_str(sorted_nodes, sorted_relas, sorted_claims)
+            community_context = get_context_str(sorted_nodes, sorted_relas)
 
         return community_context
 
@@ -410,7 +388,7 @@ class CommunityReportsExtractor(BaseProcessor):
             # If there are no sub-community reports, trim the current contexts
             results = []
             for community_context in community_contexts:
-                community_context_str = self.set_context(community_contexts, max_token=self.max_token)
+                community_context_str = self.set_context(community_contexts, max_tokens=self.max_tokens)
                 results.append(self.update_context(community_context_str, community_context))
 
             return results
@@ -421,7 +399,7 @@ class CommunityReportsExtractor(BaseProcessor):
         if not sub_level_reports and not sub_level_communities_context:
             results = []
             for community_context in community_contexts:
-                community_context_str = self.set_context(community_contexts, max_token=self.max_token)
+                community_context_str = self.set_context(community_contexts, max_tokens=self.max_tokens)
                 results.append(self.update_context(community_context_str, community_context))
 
             return results
@@ -456,7 +434,7 @@ class CommunityReportsExtractor(BaseProcessor):
                 _context_str = self.set_context(contexts_info=_local_contexts + _remaining_contexts,
                                                 sub_community_reports=_substitute_reports)
 
-                if tokenizer.get_token_num(_context_str) <= self.max_token:
+                if tokenizer.get_token_num(_context_str) <= self.max_tokens:
                     community_contexts[index].context_size = tokenizer.get_token_num(_context_str)
                     community_contexts[index].context_str = _context_str
                     exceed_flag = False
@@ -464,13 +442,11 @@ class CommunityReportsExtractor(BaseProcessor):
                     break
 
             if exceed_flag is True:
-                # 说明无法将全部的sub_communities中的report信息加入到其中，优先加入report
                 _reports = []
                 _context_str = ''
                 for _sub_report in _substitute_reports:
                     _reports.append(_sub_report)
 
-                    # 将reports转化为str形式
                     _context_str = get_context_str(sub_community_reports=_reports)
 
                     if tokenizer.get_token_num(_context_str) > self.max_tokens:
@@ -483,10 +459,11 @@ class CommunityReportsExtractor(BaseProcessor):
         llm = self.llm
         result = []
 
-        for community_context in community_contexts:
+        def process_single_context(community_context: CommunityContext) -> CommunityReport:
             community_id = community_context.community_id
             if community_context.context_size == 0 or community_context.exceed_token is True:
-                raise ValueError
+                raise ValueError(f"Invalid context for community {community_id}")
+
             prompt_variables = {
                 'input_text': community_context.context_str
             }
@@ -501,22 +478,34 @@ class CommunityReportsExtractor(BaseProcessor):
 
                 if json_match:
                     output_str = json_match.group(0)
-
                     try:
                         output = json.loads(output_str)
                     except json.JSONDecodeError as e:
-                        print(f"JSON decoding error: {e}")
-                else:
-                    print("No JSON data found in the response.")
+                        raise e
+
                 output_str = transform_output(output)
             except Exception as e:
-                print("error when generating report")
+                raise ValueError(f"Error when generating report for community {community_id}: {e}")
 
-            result.append(
-                CommunityReport(community_id=community_id, level=community_context.level,
-                                report=output_str, structured_report=output)
+            return CommunityReport(
+                community_id=community_id,
+                level=community_context.level,
+                report=output_str,
+                structured_report=output
             )
 
+        max_workers = min(32, (len(community_contexts) or 1))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_context = {executor.submit(process_single_context, context): context for context in
+                                 community_contexts}
+
+            for future in as_completed(future_to_context):
+                context = future_to_context[future]
+                try:
+                    report = future.result()
+                    result.append(report)
+                except Exception as e:
+                    raise e
         return result
 
 

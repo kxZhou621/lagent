@@ -19,13 +19,11 @@ import re
 class ChunkSplitter(BaseProcessor):
     name = 'ChunkSplitter'
 
-    def __init__(self, cfg: Optional[Dict] = None):
+    def __init__(self, chunk_size: int = DEFAULT_CHUNK_SZIE,
+                 overlap_len: int = DEFAULT_OVERLAP):
         super().__init__(name='ChunkSplitter')
-        if cfg is None:
-            cfg = {}
-        self.cfg = cfg
-        self.chunk_size = self.cfg.get('chunk_size', DEFAULT_CHUNK_SZIE)
-        self.overlap_len = self.cfg.get('overlap', min(int(self.chunk_size * 0.2), DEFAULT_OVERLAP))
+        self.chunk_size = chunk_size
+        self.overlap_len = overlap_len
 
     def run(self, graph: MultiLayerGraph) -> MultiLayerGraph:
         all_chunks = []
@@ -62,7 +60,6 @@ class ChunkSplitter(BaseProcessor):
         flag = False
         length = len(chunk)
         for i in range(len(chunk) - 1, -1, -1):
-            # 逆序遍历chunk
             text = chunk[i][0]
             if flag is True:
                 break

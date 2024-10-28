@@ -7,27 +7,13 @@ import faiss
 from typing import List, Tuple, Optional, Union, Callable, Dict, Any
 
 from lagent.rag.nlp.sentence_transformer_embedder import SentenceTransformerEmbedder
-
-
-class DocumentDB:
-    """
-        Represents a document with an ID, content, and optional metadata.It is used for building database.
-
-        Args:
-            id (str): The unique identifier for the document.
-            content (str): The textual content of the document.
-            metadata (Optional[Dict]): Additional metadata for the document.
-                Defaults to an empty dictionary if not provided.
-        """
-    def __init__(self, id: str, content: str, metadata: Optional[Dict] = None):
-        self.id = id
-        self.content = content
-        self.metadata = metadata or {}
+from lagent.utils import create_object
+from ..schema import DocumentDB
 
 
 class FaissDatabase:
     def __init__(self,
-                 embedding_model: Optional[SentenceTransformerEmbedder] = None,
+                 embedding_model: Optional[SentenceTransformerEmbedder] = dict(type=SentenceTransformerEmbedder),
                  dimension: int = 384,
                  normalize: bool = False):
         """
@@ -41,10 +27,7 @@ class FaissDatabase:
             normalize (bool): Whether to apply L2 normalization to vectors.
                 Defaults to False.
         """
-        if embedding_model is None:
-            self.embedding_model = SentenceTransformerEmbedder()
-        else:
-            self.embedding_model = embedding_model
+        self.embedding_model = create_object(embedding_model)
 
         self.dimension = dimension
         self.index = faiss.IndexFlat(dimension, faiss.METRIC_L2)

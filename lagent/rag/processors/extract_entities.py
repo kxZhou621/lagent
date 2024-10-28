@@ -1,7 +1,9 @@
 from typing import Optional, List, Dict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from lagent.rag.schema import Chunk, Node, Relationship, MultiLayerGraph
-from lagent.rag.doc import Storage
 from lagent.rag.utils import normalize_edge, replace_variables_in_prompt
+from lagent.llms import DeepseekAPI, BaseAPILLM
+from lagent.utils import create_object
 from lagent.rag.pipeline import register_processor, BaseProcessor
 from lagent.rag.prompts import ENTITY_EXTRACTION_PROMPT
 
@@ -15,11 +17,10 @@ DEFAULT_ENTITY_TYPES = ["organization", "person", "geo", "event"]
 class EntityExtractor(BaseProcessor):
     name = 'EntityExtractor'
 
-    def __init__(self, llm, entity_types: Optional[List] = None, **kwargs):
+    def __init__(self, llm: BaseAPILLM = dict(type=DeepseekAPI), entity_types: Optional[List] = None, **kwargs):
         super().__init__('EntityExtractor')
-        # TODO
         self.entity_types = entity_types or DEFAULT_ENTITY_TYPES
-        self.llm = llm
+        self.llm = create_object(llm)
         self.extraction_prompt = kwargs.get("prompts") or ENTITY_EXTRACTION_PROMPT
         self.tuple_delimiter = kwargs.get("tuple_delimiter", DEFAULT_TUPLE_DELIMITER)
         self.item_delimiter = kwargs.get("item_delimiter", DEFAULT_ITEM_DELIMITER)
@@ -27,14 +28,13 @@ class EntityExtractor(BaseProcessor):
 
     def run(self, graph: MultiLayerGraph, prompt_variables: Dict = None, **kwargs) -> MultiLayerGraph:
         """
-        从chunk中抽取实体与实体之间的关系
+        Extract entities and relationships
         Args:
-            graph:
-            prompt_variables:
+            graph: multi-layer graph containing chunk layer
+            prompt_variables: variables in the given prompt
             **kwargs:
 
-        Returns:
-
+        Returns: graph
         """
         if prompt_variables is None:
             prompt_variables = {}
@@ -64,40 +64,65 @@ class EntityExtractor(BaseProcessor):
         entities = []
         relationships = []
         chunk_to_entities: Dict[str, List[str]] = {}
-        prompt = replace_variables_in_prompt(self.extraction_prompt, prompt_variables)
-        for index, chunk in enumerate(chunks):
-            try:
+        prompt_template = replace_variables_in_prompt(self.extraction_prompt, prompt_variables)
 
-                prompt = replace_variables_in_prompt(prompt, {"input_text": chunk.content})
-                # TODO: get messages(history?)
+        prompt_template = replace_variables_in_prompt(self.extraction_prompt, prompt_variables)
+
+        def process_single_chunk(chunk: Chunk) -> Dict:
+            try:
+                prompt = replace_variables_in_prompt(prompt_template, {"input_text": chunk.content})
                 messages = [*history, {"role": "user", "content": prompt}]
+
                 response = self.llm.chat(messages, **kwargs)
+
                 _entities, _relationships = self.process_response(response)
 
-                chunk_to_entities[chunk.id] = []
+                _processed_entities = []
+                _chunk_entities_content = []
                 for _entity in _entities:
                     _entity = dict_to_entity(_entity)
                     _entity.source_id = [chunk.id]
-                    entities.append(_entity)
-                    chunk_to_entities[chunk.id].append(_entity.content)
+                    _processed_entities.append(_entity)
+                    _chunk_entities_content.append(_entity.content)
+
+                _processed_relationships = []
                 for _relationship in _relationships:
                     _relationship = dict_to_relationship(_relationship)
-                    relationships.append(_relationship)
+                    _processed_relationships.append(_relationship)
+
+                return {
+                    "chunk_id": chunk.id,
+                    "entities": _processed_entities,
+                    "chunk_entities_content": _chunk_entities_content,
+                    "relationships": _processed_relationships
+                }
 
             except Exception as e:
-                raise ValueError
+                raise ValueError(f"Error processing chunk {chunk.id}: {e}")
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {executor.submit(process_single_chunk, chunk): chunk for chunk in chunks}
+
+            for future in as_completed(futures):
+                chunk = futures[future]
+                try:
+                    result = future.result()
+                    chunk_id = result["chunk_id"]
+                    processed_entities = result["entities"]
+                    chunk_entities_content = result["chunk_entities_content"]
+                    processed_relationships = result["relationships"]
+                    chunk_to_entities[chunk_id] = chunk_entities_content
+
+                    entities.extend(processed_entities)
+                    relationships.extend(processed_relationships)
+
+                except Exception as e:
+                    print(f"Error processing chunk {chunk.id}: {e}")
+                    continue
 
         id_map_entities, id_map_relas = merge_graph(entities, relationships)
         entities = list(id_map_entities.values())
         relationships = list(id_map_relas.values())
-
-        # save
-        # storage = Storage()
-        # entities_dict = [entity.to_dict() for entity in entities]
-        # relationships_dict = [rela.to_dict() for rela in relationships]
-        # storage.put('entities', entities_dict)
-        # storage.put('relationships', relationships_dict)
-        # storage.put('chunk_to_entities', chunk_to_entities)
 
         for entity in entities:
             node_attr = {
@@ -237,9 +262,6 @@ def dict_to_relationship(relationship_dict: Dict) -> Optional[Relationship]:
         _weight = float(relationship_dict.get("weight"))
         _source_entity = relationship_dict.get("source_entity")
         _target_entity = relationship_dict.get("target_entity")
-        # use id
-        # _source_id = hashlib.md5(_source_entity.encode('utf-8')).hexdigest()
-        # _target_id = hashlib.md5(_target_entity.encode('utf-8')).hexdigest()
         _description = relationship_dict.get("description", None)
 
     except Exception as e:
